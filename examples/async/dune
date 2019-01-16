@@ -1,6 +1,8 @@
 (executables
  (libraries httpaf httpaf-async httpaf_examples async core)
- (names     async_echo_post async_get async_post))
+ (modules async_echo_post async_get async_post async_https_get async_https_echo_post)
+ (names async_echo_post async_get async_post async_https_get async_https_echo_post)
+ (flags (:standard -w -9)))
 
 (alias
  (name examples)
