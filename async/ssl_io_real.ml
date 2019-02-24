@@ -47,9 +47,50 @@ let reader_writer_of_sock ?buffer_age_limit ?reader_buffer_size ?writer_buffer_s
   ( Reader.create ?buf_len:reader_buffer_size fd
   , Writer.create ?buffer_age_limit ?buf_len:writer_buffer_size fd )
 
+let teardown_connection r w =
+  Writer.close ~force_close:(Clock.after (sec 30.)) w >>= fun () ->
+  Reader.close r
+
+(* One needs to be careful around Async Readers and Writers that share the same underyling
+   file descriptor, which is something that happens when they're used for sockets.
+
+   Closing the Reader before the Writer will cause the Writer to throw and complain about
+   its underlying file descriptor being closed. This is why instead of using Reader.pipe
+   directly below, we write out an equivalent version which will first close the Writer
+   before closing the Reader once the input pipe is fully consumed.
+
+   Additionally, [Writer.pipe] will not close the writer if the pipe is closed, so in
+   order to avoid leaking file descriptors, we allow the pipe 30 seconds to flush before
+   closing the writer. *)
+let reader_writer_pipes r w =
+  let reader_pipe_r, reader_pipe_w = Pipe.create () in
+  let writer_pipe = Writer.pipe w in
+  upon (Reader.transfer r reader_pipe_w) (fun () ->
+    teardown_connection r w >>> fun () ->
+    Pipe.close reader_pipe_w);
+  upon (Pipe.closed writer_pipe) (fun () ->
+    Deferred.choose
+      [ Deferred.choice (Clock.after (sec 30.))
+          (fun () -> ())
+      ; Deferred.choice (Pipe.downstream_flushed writer_pipe)
+          (fun (_ : Pipe.Flushed_result.t) -> ()) ] >>> fun () ->
+    don't_wait_for (teardown_connection r w));
+  reader_pipe_r, writer_pipe
+
+(* [Reader.of_pipe] will not close the pipe when the returned [Reader] is closed, so we
+   manually do that ourselves.
+
+   [Writer.of_pipe] will create a writer that will raise once the pipe is closed, so we
+   set [raise_when_consumer_leaves] to false. *)
+let reader_writer_of_pipes app_rd app_wr =
+  Reader.of_pipe (Info.of_string "async_conduit_ssl_reader") app_rd >>= fun app_reader ->
+  upon (Reader.close_finished app_reader) (fun () -> Pipe.close_read app_rd);
+  Writer.of_pipe (Info.of_string "async_conduit_ssl_writer") app_wr >>| fun (app_writer,_) ->
+  Writer.set_raise_when_consumer_leaves app_writer false;
+  app_reader, app_writer
+
 let connect r w =
-  let net_to_ssl = Reader.pipe r in
-  let ssl_to_net = Writer.pipe w in
+  let net_to_ssl, ssl_to_net = reader_writer_pipes r w in
   let app_to_ssl, app_wr = Pipe.create () in
   let app_rd, ssl_to_app = Pipe.create () in
   Ssl.client
@@ -59,19 +100,12 @@ let connect r w =
     ~net_to_ssl
     ~ssl_to_net
     ()
-  |> Deferred.Or_error.ok_exn
-  >>= fun conn ->
-    Reader.of_pipe (Info.of_string "httpaf_async_ssl_reader") app_rd >>= fun app_reader ->
-    Writer.of_pipe (Info.of_string "httpaf_async_ssl_writer") app_wr >>| fun (app_writer,_) ->
-    don't_wait_for begin
-      Deferred.all_unit [
-        Writer.close_finished app_writer ;
-        Reader.close_finished app_reader ;
-      ] >>= fun () ->
-      Ssl.Connection.close conn ;
-      Pipe.close_read app_rd ;
-      Writer.close w ;
-    end ;
+  >>= function
+  | Error error ->
+    teardown_connection r w >>= fun () ->
+    Error.raise error
+  | Ok _ ->
+    reader_writer_of_pipes app_rd app_wr >>| fun (app_reader, app_writer) ->
     (app_reader, app_writer)
 
 let make_client ?client socket =
@@ -82,8 +116,7 @@ let make_client ?client socket =
     connect reader writer
 
 let listen ~crt_file ~key_file r w =
-  let net_to_ssl = Reader.pipe r in
-  let ssl_to_net = Writer.pipe w in
+  let net_to_ssl, ssl_to_net = reader_writer_pipes r w in
   let app_to_ssl, app_wr = Pipe.create () in
   let app_rd, ssl_to_app = Pipe.create () in
   Ssl.server
@@ -94,20 +127,13 @@ let listen ~crt_file ~key_file r w =
     ~net_to_ssl
     ~ssl_to_net
     ()
-  |> Deferred.Or_error.ok_exn
-  >>= fun conn ->
-  Reader.of_pipe (Info.of_string "httpaf_async_ssl_reader") app_rd >>= fun app_reader ->
-  Writer.of_pipe (Info.of_string "httpaf_async_ssl_writer") app_wr >>| fun (app_writer,_) ->
-  don't_wait_for begin
-    Deferred.all_unit [
-      Reader.close_finished app_reader;
-      Writer.close_finished app_writer
-    ] >>= fun () ->
-    Ssl.Connection.close conn ;
-    Pipe.close_read app_rd ;
-    Writer.close w ;
-  end;
-  (app_reader, app_writer)
+  >>= function
+  | Error error ->
+    teardown_connection r w >>= fun () ->
+    Error.raise error
+  | Ok _ ->
+    reader_writer_of_pipes app_rd app_wr >>| fun (app_reader, app_writer) ->
+    (app_reader, app_writer)
 
 let make_server ?server ?certfile ?keyfile socket =
   match server, certfile, keyfile with
