@@ -53,6 +53,7 @@ let connect r w =
   let app_to_ssl, app_wr = Pipe.create () in
   let app_rd, ssl_to_app = Pipe.create () in
   Ssl.client
+    ~verify_modes:[ Verify_none ]
     ~app_to_ssl
     ~ssl_to_app
     ~net_to_ssl
