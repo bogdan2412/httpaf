@@ -1,5 +1,7 @@
+module Buffer_ = Buffer
 open Core
 open Async
+module Buffer = Buffer_
 
 let read fd buffer =
   let badfd fd = failwithf "read got back fd: %s" (Fd.to_string fd) () in
