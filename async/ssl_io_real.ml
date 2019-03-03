@@ -1,6 +1,8 @@
+module Buffer_ = Buffer
 open Core
 open Async
 open Async_ssl
+module Buffer = Buffer_
 
 module Unix = Core.Unix
 
