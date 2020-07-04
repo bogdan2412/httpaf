@@ -10,7 +10,11 @@ module Buffer : sig
   val create   : int -> t
 
   val get : t -> f:(Bigstring.t -> off:int -> len:int -> int) -> int
+  val get' : t -> f:(Bigstring.t -> off:int -> len:int -> int * 'a) -> int * 'a
   val put : t -> f:(Bigstring.t -> off:int -> len:int -> int) -> int
+
+  val to_iovec : t -> Bigstring.t Faraday.iovec
+  val advance : t -> int -> unit
 end= struct
   type t =
     { buffer      : Bigstring.t
@@ -34,13 +38,23 @@ end= struct
     end
   ;;
 
-  let get t ~f =
-    let n = f t.buffer ~off:t.off ~len:t.len in
+  let advance t n =
     t.off <- t.off + n;
     t.len <- t.len - n;
     if t.len = 0
-    then t.off <- 0;
+    then t.off <- 0
+  ;;
+
+  let get t ~f =
+    let n = f t.buffer ~off:t.off ~len:t.len in
+    advance t n;
     n
+  ;;
+
+  let get' t ~f =
+    let n, result = f t.buffer ~off:t.off ~len:t.len in
+    advance t n;
+    n, result
   ;;
 
   let put t ~f =
@@ -49,6 +63,9 @@ end= struct
     t.len <- t.len + n;
     n
   ;;
+
+  let to_iovec t =
+    { Faraday.buffer = t.buffer; off = t.off; len = t.len }
 end
 
 let read fd buffer =
@@ -86,6 +103,107 @@ let read fd buffer =
       >>= fun result -> finish fd buffer result
   in
   go fd buffer
+
+module Cleartext_transport = struct
+  type t = Fd.t
+
+  let create t = t
+  let read t buffer = read t buffer
+  let writev t iovec = Faraday_async.writev_of_fd t iovec
+end
+
+module Tls_transport = struct
+  type t =
+    { fd : Fd.t
+    ; write_to_fd : Bigstring.t Faraday.iovec list -> [ `Closed | `Ok of int ] Deferred.t
+    ; mutable state : [ `Active of Tls.Engine.state | `Eof | `Error ]
+    ; socket_read_buffer : Buffer.t
+    ; socket_write_buffer : Buffer.t
+    ; application_buffer : Buffer.t
+    }
+
+  let create fd tls_config ~read_buffer_size ~response_buffer_size =
+    { fd
+    ; write_to_fd = Faraday_async.writev_of_fd fd
+    ; state = `Active (Tls.Engine.server tls_config)
+    ; socket_read_buffer = Buffer.create read_buffer_size
+    ; socket_write_buffer = Buffer.create response_buffer_size
+    ; application_buffer = Buffer.create read_buffer_size
+    }
+
+  let write_to_socket t cstruct =
+    let rec write_loop t (cstruct : Cstruct.t) ~already_buffered =
+      if Int.(=) already_buffered cstruct.len
+      then return (`Ok already_buffered)
+      else (
+        let buffered =
+          Buffer.put t.socket_write_buffer ~f:(fun buf ~off ~len ->
+            let copy = Int.min len cstruct.len in
+            Bigstring.blit
+              ~src:cstruct.buffer
+              ~src_pos:cstruct.off
+              ~dst:buf
+              ~dst_pos:off
+              ~len:copy;
+            copy)
+        in
+        t.write_to_fd [ Buffer.to_iovec t.socket_write_buffer ]
+        >>= function
+        | `Closed -> return `Closed
+        | `Ok flushed ->
+          Buffer.advance t.socket_write_buffer flushed;
+          write_loop t cstruct ~already_buffered:(already_buffered + buffered))
+    in
+    write_loop t cstruct ~already_buffered:0
+
+  let read t =
+    match t.state with
+    | `Eof | `Error -> return `Eof
+    | `Active tls ->
+      read t.fd t.socket_read_buffer
+      >>= begin function
+      | `Eof -> return `Eof
+      | `Ok _ ->
+        let _, result =
+          Buffer.get' t.socket_read_buffer ~f:(fun bigstring ~off ~len ->
+            len,
+            Tls.Engine.handle_tls tls (Cstruct.of_bigarray ~off ~len bigstring))
+        in
+        match result with
+        | `Fail (failure, `Response response) ->
+          t.state <- `Error;
+          Log.Global.error "TLS error: %s" (Tls.Engine.string_of_failure failure);
+          t.write_to_fd
+            [ { Faraday.buffer = response.buffer
+              ; off = response.off
+              ; len = response.len
+              }
+            ]
+          >>| fun (_ : [ `Closed | `Ok of int ]) -> `Eof
+        | `Ok (state', `Response response, `Data data) ->
+          let state' =
+            match state' with
+            | `Ok tls -> `Active tls
+            | `Eof -> `Eof
+            | `Alert alert ->
+              Log.Global.error "TLS error: %s" (Tls.Packet.alert_type_to_string alert);
+              `Error
+          in
+          t.state <- state';
+          (match response with
+           | None -> Deferred.unit
+           | Some response ->
+             t.write_to_fd
+               [ { Faraday.buffer = response.buffer
+                 ; off = response.off
+                 ; len = response.len
+                 }
+               ]
+             >>| fun (_ : [ `Closed | `Ok of int ]) -> ())
+          >>=
+      end
+  ;;
+end
 
 open Httpaf
 
