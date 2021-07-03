@@ -4,7 +4,7 @@ open Async
 open Async_ssl
 module Buffer = Buffer_
 
-module Unix = Core.Unix
+module Unix = Core_unix
 
 
 let readf ssl_reader =

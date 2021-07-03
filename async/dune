@@ -2,7 +2,7 @@
  (name        httpaf_async)
  (public_name httpaf-async)
  (libraries
-   async core angstrom-async faraday-async httpaf
+   async core_kernel.core angstrom-async faraday-async httpaf
    (select ssl_io.ml from
     (async_ssl  -> ssl_io_real.ml)
     (!async_ssl -> ssl_io_dummy.ml)))
